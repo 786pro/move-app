@@ -1,7 +1,3 @@
-// MOVE! – Listings API (Vercel)
-// PropertyData /prices for map pins
-// Rightmove location ID lookup for working portal links
-
 const https = require('https');
 
 module.exports = async (req, res) => {
@@ -9,13 +5,14 @@ module.exports = async (req, res) => {
   const { lat, lng, status = 'sale', radius = '1' } = req.query;
   if (!lat || !lng) return res.status(400).json({ error: 'Missing lat/lng' });
 
-  const PD_KEY = process.env.PROPERTYDATA_KEY;
+  const PD_KEY = process.env.PROPERTYDATA_KEY || 'FML2RPCTZV';
   const listingStatus = status === 'rent' ? 'rent' : 'sale';
 
   try {
-    // Step 1: Get property price data from PropertyData
-    const pdPath = `/prices?key=${PD_KEY}&location=${lat},${lng}&listing_status=${listingStatus}&radius=${radius}`;
-    const pdRaw = await httpsGet('api.propertydata.co.uk', pdPath);
+    // Step 1: Get property data from PropertyData
+    const pdRaw = await httpsGet('api.propertydata.co.uk',
+      `/prices?key=${PD_KEY}&location=${lat},${lng}&listing_status=${listingStatus}&radius=${radius}`
+    );
     const pdData = JSON.parse(pdRaw);
     if (pdData.status === 'error') return res.status(502).json({ error: pdData.message });
 
@@ -27,11 +24,39 @@ module.exports = async (req, res) => {
       if (avg > 10000) return res.status(200).json({ listings:[], count:0, warning:'Rent data unavailable' });
     }
 
-    // Step 2: Get Rightmove location ID for this area
-    // This gives us a working Rightmove search URL
-    const rmLocation = await getRightmoveLocationId(lat, lng);
+    // Step 2: Get postcode from coordinates
+    let postcode = null;
+    let outcode = null;
+    let rmLocationId = null;
 
-    // Deduplicate
+    try {
+      const pcRaw = await httpsGet('api.postcodes.io', `/postcodes?lon=${lng}&lat=${lat}&limit=1`);
+      const pcData = JSON.parse(pcRaw);
+      postcode = pcData.result?.[0]?.postcode;
+      if (postcode) outcode = postcode.split(' ')[0];
+    } catch(e) {}
+
+    // Step 3: Get Rightmove location identifier using their typeahead API
+    if (outcode) {
+      try {
+        const rmRaw = await httpsGetWithHeaders('los.rightmove.co.uk',
+          `/typeahead?query=${encodeURIComponent(outcode)}&limit=5&exclude=`,
+          {
+            'Referer': 'https://www.rightmove.co.uk/',
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          }
+        );
+        const rmData = JSON.parse(rmRaw);
+        // Find postcode or outcode match
+        const match = rmData.matches?.find(m =>
+          m.type === 'OUTCODE' || m.type === 'POSTCODE'
+        );
+        if (match) rmLocationId = `${match.type}^${match.id}`;
+      } catch(e) {}
+    }
+
+    // Deduplicate by lat/lng/price
     const seen = new Set();
     const listings = props.filter(p => {
       const key = `${p.lat},${p.lng},${p.price}`;
@@ -44,23 +69,35 @@ module.exports = async (req, res) => {
       const price = parseInt(p.price || 0);
       const portal = p.portal || 'rightmove.co.uk';
 
-      // Build working portal URL using Rightmove location identifier
       let url;
-      if (rmLocation && portal.includes('rightmove')) {
-        const locId = encodeURIComponent(rmLocation);
-        if (listingStatus === 'rent') {
-          url = `https://www.rightmove.co.uk/property-to-rent/find.html?locationIdentifier=${locId}&maxBedrooms=&minBedrooms=&maxPrice=${price+500}&minPrice=${Math.max(0,price-500)}&radius=0.25&sortType=6&includeLetAgreed=false`;
+
+      if (portal.includes('rightmove')) {
+        if (rmLocationId) {
+          // Use proper Rightmove location identifier — this WORKS
+          const locEnc = encodeURIComponent(rmLocationId);
+          if (listingStatus === 'rent') {
+            url = `https://www.rightmove.co.uk/property-to-rent/find.html?locationIdentifier=${locEnc}&radius=0.25&maxPrice=${price+500}&minPrice=${Math.max(0,price-500)}&sortType=6&includeLetAgreed=false`;
+          } else {
+            url = `https://www.rightmove.co.uk/property-for-sale/find.html?locationIdentifier=${locEnc}&radius=0.25&maxPrice=${price+50000}&minPrice=${Math.max(0,price-50000)}&sortType=6&includeSSTC=false`;
+          }
+        } else if (outcode) {
+          // Fallback — Rightmove outcode search without ID still works for browsing
+          if (listingStatus === 'rent') {
+            url = `https://www.rightmove.co.uk/property-to-rent/find.html?searchType=RENT&locationIdentifier=OUTCODE%5E${outcode}&radius=0.25&maxPrice=${price+500}&minPrice=${Math.max(0,price-500)}&sortType=6`;
+          } else {
+            url = `https://www.rightmove.co.uk/property-for-sale/find.html?searchType=SALE&locationIdentifier=OUTCODE%5E${outcode}&radius=0.25&maxPrice=${price+50000}&minPrice=${Math.max(0,price-50000)}&sortType=6`;
+          }
         } else {
-          url = `https://www.rightmove.co.uk/property-for-sale/find.html?locationIdentifier=${locId}&maxBedrooms=&minBedrooms=&maxPrice=${price+50000}&minPrice=${Math.max(0,price-50000)}&radius=0.25&sortType=6&includeSSTC=false`;
+          url = `https://www.rightmove.co.uk/property-for-sale/find.html?searchType=SALE&searchLocation=${pLat},${pLng}&radius=0.25`;
         }
       } else if (portal.includes('zoopla')) {
-        url = listingStatus === 'rent'
-          ? `https://www.zoopla.co.uk/to-rent/property/lat/${pLat}/lng/${pLng}/?radius=0.25&price_max=${price+500}&price_min=${Math.max(0,price-500)}`
-          : `https://www.zoopla.co.uk/for-sale/property/lat/${pLat}/lng/${pLng}/?radius=0.25&price_max=${price+50000}&price_min=${Math.max(0,price-50000)}`;
+        if (listingStatus === 'rent') {
+          url = `https://www.zoopla.co.uk/to-rent/property/lat/${pLat}/lng/${pLng}/?radius=0.25&price_frequency=per_month&price_max=${price+500}&price_min=${Math.max(0,price-500)}&results_sort=newest_listings`;
+        } else {
+          url = `https://www.zoopla.co.uk/for-sale/property/lat/${pLat}/lng/${pLng}/?radius=0.25&price_max=${price+50000}&price_min=${Math.max(0,price-50000)}&results_sort=newest_listings`;
+        }
       } else {
-        url = listingStatus === 'rent'
-          ? `https://www.rightmove.co.uk/property-to-rent/find.html?searchLocation=${pLat},${pLng}&radius=0.25`
-          : `https://www.rightmove.co.uk/property-for-sale/find.html?searchLocation=${pLat},${pLng}&radius=0.25`;
+        url = `https://www.onthemarket.com/${listingStatus==='rent'?'to-rent':'for-sale'}/?lat=${pLat}&lng=${pLng}&radius=0.25`;
       }
 
       return {
@@ -76,38 +113,11 @@ module.exports = async (req, res) => {
       };
     }).filter(p => p.lat && p.lng);
 
-    res.status(200).json({ listings, count: listings.length, rmLocation });
+    res.status(200).json({ listings, count: listings.length, debug: { outcode, rmLocationId } });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
 };
-
-// Get Rightmove location identifier from coordinates
-// Uses Rightmove's typeahead API to find the nearest location
-async function getRightmoveLocationId(lat, lng) {
-  try {
-    // First get a postcode from coordinates using postcodes.io (free, no key needed)
-    const pcRaw = await httpsGet('api.postcodes.io', `/postcodes?lon=${lng}&lat=${lat}&limit=1`);
-    const pcData = JSON.parse(pcRaw);
-    const postcode = pcData.result?.[0]?.postcode;
-    if (!postcode) return null;
-
-    // Then look up Rightmove location ID for that postcode
-    const outcode = postcode.split(' ')[0];
-    const rmPath = `/api/typeahead/v1/units?t=POSTCODE&s=${encodeURIComponent(outcode)}`;
-    const rmRaw = await httpsGet('www.rightmove.co.uk', rmPath, {
-      'User-Agent': 'Mozilla/5.0 (compatible; MOVE-App/1.0)',
-      'Accept': 'application/json',
-      'Referer': 'https://www.rightmove.co.uk/',
-    });
-
-    const rmData = JSON.parse(rmRaw);
-    const loc = rmData?.typeAheadLocations?.[0];
-    return loc ? loc.locationIdentifier : `POSTCODE^${outcode}`;
-  } catch(e) {
-    return null;
-  }
-}
 
 function formatPrice(n) {
   if (!n) return 'POA';
@@ -116,10 +126,14 @@ function formatPrice(n) {
   return '£' + n.toLocaleString();
 }
 
-function httpsGet(hostname, path, extraHeaders = {}) {
+function httpsGet(hostname, path) {
+  return httpsGetWithHeaders(hostname, path, { 'User-Agent': 'MOVE-App/1.0' });
+}
+
+function httpsGetWithHeaders(hostname, path, headers) {
   return new Promise((resolve, reject) => {
     const req = https.request(
-      { hostname, path, method:'GET', headers:{'User-Agent':'MOVE-App/1.0', ...extraHeaders}, timeout:15000 },
+      { hostname, path, method:'GET', headers, timeout:15000 },
       (res) => { let b=''; res.on('data',c=>b+=c); res.on('end',()=>resolve(b)); }
     );
     req.on('error', reject);
